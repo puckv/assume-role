@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+
+CREDFILE=~/.aws/credentials.gpg
+
+# Check for wrong usage
+if [[ -z "$1" || ! -z "$3" ]]; then
+    >&2 echo "Usage:
+    assume-role <role-name>
+    assume-role <account-id> <role-name>"
+    exit 1
+fi
+
+# Read STS caller identity
+if [[ ! -z "$AWS_ACCESS_KEY_ID" || ! -z "$AWS_SECRET_ACCESS_KEY" ]]; then
+    >&2 echo "Using AWS credentials found in environment variables"
+    read IDENTITY_ACCOUNT IDENTITY_ARN < <(aws sts get-caller-identity --query "[Account,Arn]" --output text)
+fi
+
+if [[ -z "$IDENTITY_ACCOUNT" || -z "$IDENTITY_ARN" ]]; then
+    >&2 echo "Decrypting AWS credentials from ${CREDFILE}"
+    read AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY < <(gpg -d "$CREDFILE")
+    if [[ $? -ne 0 ]]; then
+        >&2 echo "Error decrypting $CREDFILE"
+        exit 6
+    fi
+    export AWS_ACCESS_KEY_ID
+    export AWS_SECRET_ACCESS_KEY
+    unset AWS_SESSION_TOKEN
+
+    read IDENTITY_ACCOUNT IDENTITY_ARN < <(aws sts get-caller-identity --query "[Account,Arn]" --output text)
+    if [[ $? -ne 0 ]]; then
+        >&2 "Error executing aws sts-get-caller-identity"
+        exit 7
+    fi
+fi
+
+# Detect arguments
+if [[ -z "$2" ]]; then
+    ACCOUNT_ID="$IDENTITY_ACCOUNT"
+    ROLE_NAME="$1"
+else
+    ACCOUNT_ID="$1"
+    ROLE_NAME="$2"
+fi
+ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${ROLE_NAME}"
+
+# Detect identity details
+IDENTITY_STRING=$(echo "$IDENTITY_ARN" | cut -d ':' -f 6)
+IDENTITY_TYPE=$(echo "$IDENTITY_STRING" | cut -d '/' -f 1)
+IDENTITY_NAME=$(echo "$IDENTITY_STRING" | cut -d '/' -f 2)
+
+# If already assumed this role
+if [[ "assumed-role" == "$IDENTITY_TYPE" && "$IDENTITY_ACCOUNT" == "$ACCOUNT_ID" && "$IDENTITY_NAME" == "$ROLE_NAME" ]]; then
+    exit 0
+fi
+
+if [[ "user" == "$IDENTITY_TYPE" ]]; then
+    MFA_ARN=$(aws iam list-mfa-devices --user-name ${IDENTITY_NAME} --query MFADevices[0].SerialNumber --output text)
+    >&2 printf "Enter MFA code for $IDENTITY_STRING: "
+    read MFA_CODE
+    MFA_PARAMS="--serial-number=$MFA_ARN --token-code=$MFA_CODE"
+fi
+
+read AR_ACCESS_KEY AR_SECRET_KEY AR_SESSION_TOKEN < <(
+    aws sts assume-role \
+        --role-arn="$ROLE_ARN" \
+        --role-session-name="${IDENTITY_TYPE}-${IDENTITY_NAME}" \
+        ${MFA_PARAMS} \
+        --output text \
+        --query "Credentials.[AccessKeyId,SecretAccessKey,SessionToken]"
+)
+
+if [[ $? -ne 0 || -z "$AR_ACCESS_KEY" || -z "$AR_SECRET_KEY" || -z "$AR_SESSION_TOKEN" ]]; then
+    >&2 echo "Error executing aws sts assume-role"
+    exit 3
+fi
+
+echo "export AWS_ACCESS_KEY_ID=${AR_ACCESS_KEY}"
+echo "export AWS_SECRET_ACCESS_KEY=${AR_SECRET_KEY}"
+echo "export AWS_SESSION_TOKEN=${AR_SESSION_TOKEN}"
